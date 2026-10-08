@@ -8,6 +8,14 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // CEO 08.10.2026: ausgeliefert wird unter /voice2/ im dashboard-Vhost,
+  // dessen Webroot /var/www/agentic-movers/apps ist. Ohne base erzeugt
+  // Vite absolute Pfade (/assets/...), und die zeigen vom Vhost-Root aus
+  // ins Leere — gemessen: /voice2/assets/index.js gibt 200, aber der
+  // Browser laedt /assets/index.js und bekommt 404. Die Seite bliebe
+  // weiss, obwohl index.html mit 200 antwortet.
+  base: "/voice2/",
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

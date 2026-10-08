@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "./tauri-shim";
+import { listen } from "./tauri-shim";
 import "./App.css";
 
 interface ProcessingState {
