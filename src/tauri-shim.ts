@@ -91,6 +91,11 @@ export async function listen<T = unknown>(
       if (e.repeat) return;
       e.preventDefault();
       rueckruf({ payload: undefined as T });
+      // Zusaetzlich als window-Ereignis: src/sprachkette.ts haengt sich
+      // dort ein und macht die eigentliche Aufnahme. Ohne diese Zeile
+      // dreht sich nur der Orb — gemessen 08.10. 10:4x an /voice2/:
+      // getUserMedia-Aufrufe 0, Orb auf animate-spin-medium.
+      window.dispatchEvent(new CustomEvent(ereignis));
     };
     window.addEventListener(typ, h);
     return () => window.removeEventListener(typ, h);
@@ -98,7 +103,12 @@ export async function listen<T = unknown>(
 
   if (ereignis === "pipeline_interrupted") {
     const h = (e: KeyboardEvent) => {
-      if (e.key === "Escape") rueckruf({ payload: undefined as T });
+      if (e.key !== "Escape") return;
+      rueckruf({ payload: undefined as T });
+      // Eigener Name, KEIN dispatchEvent("pipeline_interrupted"): dieses
+      // Ereignis wird weiter unten selbst ueber den window-Bus
+      // abonniert, das waere eine Schleife.
+      window.dispatchEvent(new CustomEvent("sprachkette_abbruch"));
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
