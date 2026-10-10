@@ -287,32 +287,124 @@ async function verarbeite(audio: Blob): Promise<void> {
 /** Noch nicht gesprochene Saetze, damit `idle` zum richtigen Zeitpunkt kommt. */
 let offeneSaetze = 0;
 
+/** Laufender Abspieler, damit `unterbrich` ihn stoppen kann. */
+let aktuellesAudio: HTMLAudioElement | null = null;
+/** Fertige, noch nicht gespielte Saetze (Technik 2: Vorsprung halten). */
+const warteschlange: Array<{ nr: number; url: string }> = [];
+let spieltGerade = false;
+/** Abbruchmarke: nach `unterbrich` darf kein alter Satz mehr kommen. */
+let ausgabeLauf = 0;
+
+/**
+ * Einen Satz sprechen — mit Breeze-TTS-2, nicht mit der Systemstimme.
+ *
+ * GH#2894, Daniel 10.10.: "breeze war und die specs aus dem video!
+ * obligatorisch! dann nutze auch die bestandteile und nichts anderes!"
+ * Vorher stand hier `speechSynthesis` (Windows-Stimme Hedda). Die
+ * funktioniert — sie ist nur nicht die Stimme aus dem Video.
+ *
+ * Technik 2 aus dem Video ("stop taking turns and make them parallel"):
+ * Das Holen der Audiodaten laeuft SOFORT los, das Abspielen haengt sich
+ * hinten an. Waehrend Satz N klingt, ist Satz N+1 schon unterwegs.
+ * Voraussetzung ist eine Stimme, die schneller erzeugt als abspielt —
+ * gemessen 1,6x Echtzeit (Codacus nennt 1,1x als Schwelle).
+ */
 function sprichSatz(satz: string): void {
-  if (!("speechSynthesis" in window)) {
-    // Kein stiller Ausfall: ohne Stimme ist es eine Textanwendung, und
-    // das soll sichtbar sein.
-    stufe("error", "Dieser Browser kann nicht sprechen (speechSynthesis fehlt).");
-    return;
-  }
-  const a = new SpeechSynthesisUtterance(satz);
-  a.lang = "de-DE";
-  a.rate = 1.05;
+  const meinLauf = ausgabeLauf;
   offeneSaetze++;
-  const fertig = () => {
+  const nr = offeneSaetze;
+
+  void (async () => {
+    try {
+      const r = await fetch(`${BASIS}/stimme`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: satz }),
+      });
+      if (meinLauf !== ausgabeLauf) return; // unterbrochen
+      if (!r.ok) {
+        // Kein stiller Ausfall. Der Dienst liefert bei einem Fehler JSON
+        // mit Adresse und Modell — genau das gehoert in die Anzeige,
+        // sonst sucht man an einem stummen Abspieler nach der Ursache.
+        let grund = `HTTP ${r.status}`;
+        try {
+          const j = await r.json();
+          if (j?.fehler) grund = `${j.fehler} (${j.tts ?? "?"})`;
+        } catch { /* Antwort war kein JSON */ }
+        dlog("stimme FEHLER", grund);
+        stufe("error", `Sprachausgabe: ${grund}`);
+        offeneSaetze = Math.max(0, offeneSaetze - 1);
+        return;
+      }
+      const blob = await r.blob();
+      dlog("stimme ok nr=", nr, "bytes=", blob.size, "type=", blob.type);
+      if (meinLauf !== ausgabeLauf) return;
+      warteschlange.push({ nr, url: URL.createObjectURL(blob) });
+      warteschlange.sort((a, b) => a.nr - b.nr);
+      void spieleNaechsten(meinLauf);
+    } catch (e) {
+      dlog("stimme Ausnahme", String(e));
+      stufe("error", `Sprachausgabe: ${String(e)}`);
+      offeneSaetze = Math.max(0, offeneSaetze - 1);
+    }
+  })();
+}
+
+/** Spielt die Warteschlange ab, einen Satz nach dem anderen. */
+async function spieleNaechsten(meinLauf: number): Promise<void> {
+  if (spieltGerade || meinLauf !== ausgabeLauf) return;
+  const naechster = warteschlange.shift();
+  if (!naechster) return;
+  spieltGerade = true;
+  try {
+    const a = new Audio(naechster.url);
+    aktuellesAudio = a;
+    stufe("speaking");
+    await new Promise<void>((fertig) => {
+      a.onended = () => fertig();
+      a.onerror = () => { dlog("audio onerror nr=", naechster.nr); fertig(); };
+      void a.play().catch((e) => {
+        // Ohne Nutzergeste blockieren Browser die Wiedergabe. In der
+        // Tauri-Anwendung ist das nicht der Fall, im Browsertab schon —
+        // und dann ist Stille das Symptom.
+        dlog("audio play blockiert:", String(e));
+        stufe("error", `Wiedergabe blockiert: ${String(e)}`);
+        fertig();
+      });
+    });
+  } finally {
+    URL.revokeObjectURL(naechster.url);
+    aktuellesAudio = null;
+    spieltGerade = false;
     offeneSaetze = Math.max(0, offeneSaetze - 1);
-    if (offeneSaetze === 0 && !laufendeAntwort) stufe("idle");
-  };
-  a.onend = fertig;
-  a.onerror = fertig;
-  window.speechSynthesis.speak(a);
+    if (warteschlange.length) {
+      void spieleNaechsten(meinLauf);
+    } else if (offeneSaetze === 0 && !laufendeAntwort) {
+      stufe("idle");
+    }
+  }
 }
 
 /** Alles sofort abbrechen: Escape, oder die naechste Frage. */
 export function unterbrich(): void {
   laufendeAntwort?.abort();
   laufendeAntwort = null;
-  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  // Daniels Hauptkritik am alten Stand war, dass man NICHT unterbrechen
+  // kann. Drei Dinge muessen fallen: der laufende Ton, die Warteschlange
+  // und die noch unterwegs befindlichen Abrufe (ueber die Laufmarke).
+  ausgabeLauf++;
+  if (aktuellesAudio) {
+    aktuellesAudio.pause();
+    aktuellesAudio = null;
+  }
+  while (warteschlange.length) {
+    const w = warteschlange.pop();
+    if (w) URL.revokeObjectURL(w.url);
+  }
+  spieltGerade = false;
   offeneSaetze = 0;
+  // Die Systemstimme kann aus einem frueheren Stand noch laufen.
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
 }
 
 // ------------------------------------------------------------ Verdrahtung
