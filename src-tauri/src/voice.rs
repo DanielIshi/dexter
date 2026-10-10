@@ -93,6 +93,19 @@ pub fn transcribe_audio(
     let mut state = ctx.create_state()?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    // ENGLISCH bleibt, bis Daniel die englische Kette E2E abgenommen hat.
+    //
+    // 10.10.: Ich hatte hier schon auf "auto" umgestellt, damit Deutsch
+    // mitlaeuft. Daniel: "bring erstmal englisch zurueck, das setting
+    // hatte ich e2e noch NICHT abgenommen! wir wollen erstmal 2
+    // funktionierende presets!" — richtig: eine zweite Sprache in eine
+    // unabgenommene Kette zu legen, macht beide unpruefbar. Wenn dann
+    // etwas klemmt, ist nicht mehr trennbar, ob es an der Sprache liegt
+    // oder an der Kette.
+    //
+    // Geplant ist KEINE Auto-Erkennung, sondern zwei feste Presets
+    // (en, de) — umschaltbar, jedes fuer sich abgenommen. Auto raet,
+    // ein Preset nicht.
     params.set_language(Some("en"));
     params.set_print_special(false);
     params.set_print_progress(false);

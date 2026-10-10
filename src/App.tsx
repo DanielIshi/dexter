@@ -497,6 +497,35 @@ function Orb() {
   const [bubbles, setBubbles] = useState<ChatBubble[]>([]);
   const bubblesEndRef = useRef<HTMLDivElement>(null);
 
+  // 10.10.2026 (CEO, GH#2990): Wachhund gegen haengende Zwischenzustaende.
+  //
+  // Daniel: "wie stoppe ich denn das zuhoeren? jetzt die ganze zeit gelb
+  // transcribing steht da". Bleibt eine Stufe stehen, zeigt die Anzeige
+  // einen Zustand, den es nicht mehr gibt — und der Nutzer wartet auf
+  // etwas, das nie kommt. Schlimmer als ein Fehler, weil es wie Arbeit
+  // aussieht.
+  //
+  // Nur die VORUEBERGEHENDEN Stufen bekommen eine Frist. "speaking" ist
+  // bewusst NICHT dabei: eine lange Antwort darf lange sprechen.
+  useEffect(() => {
+    const FRISTEN: Record<string, number> = {
+      listening: 60_000,     // Taste klemmt oder wurde nie losgelassen
+      transcribing: 45_000,  // Erkennung braucht sonst 0,3-1 s
+      thinking: 120_000,     // Modell kalt oder Warteschlange
+      tool_call: 120_000,
+    };
+    const frist = FRISTEN[stage];
+    if (!frist) return;
+    const t = setTimeout(() => {
+      setStage("idle");
+      addBubble(
+        "status",
+        `Abgebrochen — "${stage}" hat nicht geantwortet. Shift+Z fuer einen neuen Versuch.`,
+      );
+    }, frist);
+    return () => clearTimeout(t);
+  }, [stage]);
+
   const audioQueueRef = useRef<{ index: number; url: string }[]>([]);
   const isPlayingRef = useRef(false);
   const totalChunksRef = useRef<number | null>(null);

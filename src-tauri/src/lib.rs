@@ -846,9 +846,39 @@ pub fn run() {
                 }
             })?;
 
-            // Register Shift+X to hide/dismiss the window
+            // Shift+X: ABBRECHEN und verstecken.
+            //
+            // 10.10.2026 (CEO, GH#2990), Daniel: "wie stoppe ich denn das
+            // zuhoeren? jetzt die ganze zeit gelb transcribing steht da" —
+            // er hatte keinen Weg zurueck. Shift+X versteckte nur das
+            // Fenster, die Pipeline lief weiter; Shift+Z bricht zwar ab,
+            // startet aber sofort eine neue Aufnahme. Ein reines
+            // "vergiss es" fehlte, und die Anzeige blieb auf einem
+            // Zustand stehen, den es nicht mehr gab.
+            //
+            // Der Abbruchmechanismus ist Codacus' eigener
+            // (pipeline_cancel + pipeline_interrupted), er wurde hier nur
+            // nicht ausgeloest. Also kein neuer Weg, sondern der
+            // vorhandene an die Taste gelegt, die der Nutzer dafuer haelt.
             app.global_shortcut().on_shortcut("Shift+X", |app, _shortcut, event| {
                 if event.state == ShortcutState::Pressed {
+                    {
+                        let state = app.state::<AppState>();
+                        let mut cancel = state.pipeline_cancel.lock().unwrap();
+                        cancel.cancel();
+                        *cancel = CancellationToken::new();
+                        // Eine laufende Aufnahme beenden, sonst nimmt der
+                        // Rekorder nach dem Verstecken weiter auf.
+                        *state.is_recording.lock().unwrap() = false;
+                    }
+                    // Oberflaeche zuruecksetzen: Audio stoppen (App.tsx
+                    // haengt an pipeline_interrupted) und Zustand idle,
+                    // damit nicht Gelb stehen bleibt.
+                    let _ = app.emit("pipeline_interrupted", ());
+                    let _ = app.emit("processing", ProcessingState {
+                        stage: "idle".to_string(),
+                        text: String::new(),
+                    });
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.hide();
                     }
