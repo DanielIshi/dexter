@@ -1,0 +1,43 @@
+name: Windows-Build (voice-assistant.exe)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust-Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm run build
+        env:
+          VITE_VOICE_API: https://app.make-my-life-easier.com/voice-api
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --verbose
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-assistant-windows
+          path: src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-assistant-exe
+          path: src-tauri/target/release/voice-assistant.exe
+          if-no-files-found: warn
