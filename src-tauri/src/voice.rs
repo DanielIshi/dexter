@@ -4,7 +4,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tokio::sync::mpsc;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 use std::collections::HashMap;
 
 // ── Audio Recording (cpal) ──
@@ -76,55 +75,76 @@ pub fn record_audio(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
 
 // ── Whisper Transcription (native) ──
 
-pub fn transcribe_audio(
-    model_path: &str,
+pub async fn transcribe_audio(
+    stt_basis: &str,
     samples: &[f32],
     source_sample_rate: u32,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Resample to 16kHz mono if needed
+    // 10.10.2026 (CEO, GH#2988): Transkription ueber unseren Dienst
+    // statt lokal mit whisper-rs.
+    //
+    // Daniel drueckte Shift+Z, die Anzeige blieb auf "transcribing",
+    // und im Caddy-Log stand KEINE Anfrage von ihm. Bei lokaler
+    // Transkription geht erst danach etwas ins Netz — kein Request
+    // heisst also, sie haengt hier. (Erster Lauf laedt 148 MB Modell
+    // auf die CPU; im Fehlerfall ohne Rueckmeldung.)
+    //
+    // Unser faster-whisper laeuft auf dell-7740 hinter
+    // /voice-api/hoeren und braucht 0,29 s fuer dieselbe Aufnahme.
+    //
+    // Der Rest von Codacus' Pipeline bleibt unangetastet: Saetze
+    // sequenziell aus dem Kanal, TTS je Satz, keine Parallelitaet.
+    // Geaendert ist nur, WOHER der Text kommt.
+    //
+    // async statt spawn_blocking, weil Netz-I/O keinen Thread blockiert.
     let audio_16k = if source_sample_rate != 16000 {
         resample(samples, source_sample_rate, 16000)
     } else {
         samples.to_vec()
     };
 
-    let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())?;
-
-    let mut state = ctx.create_state()?;
-
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    // ENGLISCH bleibt, bis Daniel die englische Kette E2E abgenommen hat.
-    //
-    // 10.10.: Ich hatte hier schon auf "auto" umgestellt, damit Deutsch
-    // mitlaeuft. Daniel: "bring erstmal englisch zurueck, das setting
-    // hatte ich e2e noch NICHT abgenommen! wir wollen erstmal 2
-    // funktionierende presets!" — richtig: eine zweite Sprache in eine
-    // unabgenommene Kette zu legen, macht beide unpruefbar. Wenn dann
-    // etwas klemmt, ist nicht mehr trennbar, ob es an der Sprache liegt
-    // oder an der Kette.
-    //
-    // Geplant ist KEINE Auto-Erkennung, sondern zwei feste Presets
-    // (en, de) — umschaltbar, jedes fuer sich abgenommen. Auto raet,
-    // ein Preset nicht.
-    params.set_language(Some("en"));
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_suppress_blank(true);
-    params.set_single_segment(true);
-
-    state.full(params, &audio_16k)?;
-
-    let num_segments = state.full_n_segments()?;
-    let mut text = String::new();
-    for i in 0..num_segments {
-        if let Ok(segment) = state.full_get_segment_text(i) {
-            text.push_str(&segment);
+    // WAV im Speicher bauen — der Dienst nimmt multipart wie ein Browser.
+    let mut wav: Vec<u8> = Vec::with_capacity(audio_16k.len() * 2 + 44);
+    {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::new(
+            std::io::Cursor::new(&mut wav), spec)?;
+        for s in &audio_16k {
+            // Begrenzen, sonst kippt ein lautes Signal in den Ueberlauf.
+            w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
         }
+        w.finalize()?;
     }
 
-    Ok(text.trim().to_string())
+    let teil = reqwest::multipart::Part::bytes(wav)
+        .file_name("aufnahme.wav")
+        .mime_str("audio/wav")?;
+    let form = reqwest::multipart::Form::new().part("file", teil);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let resp = client
+        .post(format!("{}/hoeren", stt_basis.trim_end_matches('/')))
+        .multipart(form)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        // Ehrlicher Fehler statt stillem Haengen — genau daran hat
+        // Daniel heute mehrfach vor dem Bildschirm gewartet.
+        return Err(format!("STT {}: {}", status, &body[..body.len().min(200)]).into());
+    }
+
+    let j: serde_json::Value = resp.json().await?;
+    Ok(j.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string())
 }
 
 fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {

@@ -330,13 +330,14 @@ async fn process_pipeline(
     )
     .map_err(|e: tauri::Error| e.to_string())?;
 
-    let model_path = config.whisper_model_path.clone();
-    let transcript = tokio::task::spawn_blocking(move || {
-        voice::transcribe_audio(&model_path, &samples, sample_rate)
-    })
-    .await
-    .map_err(|e| format!("Transcription task failed: {}", e))?
-    .map_err(|e| format!("Transcription failed: {}", e))?;
+    // GH#2988: kein spawn_blocking mehr — die Transkription ist jetzt
+    // ein HTTP-Aufruf an unseren Dienst, kein CPU-Lauf. Die Adresse
+    // steht in VoiceConfig (ollama_url), damit Codacus' Konfiguration
+    // die einzige Quelle bleibt.
+    let stt_basis = config.ollama_url.clone();
+    let transcript = voice::transcribe_audio(&stt_basis, &samples, sample_rate)
+        .await
+        .map_err(|e| format!("Transcription failed: {}", e))?;
 
     if cancel.is_cancelled() { return Err("interrupted".to_string()); }
 
