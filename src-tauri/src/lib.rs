@@ -786,62 +786,26 @@ pub fn run() {
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
+                        // 10.10.2026 (CEO, GH#2988): NUR das Ereignis, KEINE
+                        // Aufnahme hier. Die Aufnahme macht der WebView
+                        // (src/sprachkette.ts, MediaRecorder) und schickt sie
+                        // an /voice-api/hoeren. Lief beides, griffen zwei
+                        // Wege gleichzeitig aufs Mikrofon; Windows vergibt das
+                        // Geraet exklusiv, der zweite bekam Stille. Belegt im
+                        // Caddy-Log: Daniels POST /hoeren trug 2844 Byte
+                        // (~0,1 s) statt der gesprochenen Sekunden -- und die
+                        // Rust-Seite meldete parallel "No audio recorded".
                         let _ = app.emit("hotkey_pressed", ());
-
-                        // Start recording
-                        let state = app.state::<AppState>();
-                        let is_rec = *state.is_recording.lock().unwrap();
-                        if !is_rec {
-                            state.recorded_samples.lock().unwrap().clear();
-                            *state.is_recording.lock().unwrap() = true;
-                            let app_clone = app.clone();
-                            std::thread::spawn(move || {
-                                if let Err(e) = voice::record_audio(&app_clone) {
-                                    eprintln!("Recording error: {}", e);
-                                }
-                            });
-                        }
                     }
                     ShortcutState::Released => {
+                        // 10.10.2026 (CEO, GH#2988): NUR das Ereignis. Die
+                        // Rust-Pipeline lief parallel zur WebView-Kette und
+                        // meldete aus ihrem leeren Puffer "No audio recorded"
+                        // -- genau der Text, den Daniel sah, waehrend die
+                        // WebView-Kette daneben ihre eigene Aufnahme schickte.
+                        // Verarbeitung macht src/sprachkette.ts: /hoeren
+                        // (faster-whisper), /sprechen (SSE), speechSynthesis.
                         let _ = app.emit("hotkey_released", ());
-
-                        // Stop recording and process
-                        let state = app.state::<AppState>();
-                        *state.is_recording.lock().unwrap() = false;
-
-                        // Grab the current cancel token for this pipeline
-                        let cancel_token = state.pipeline_cancel.lock().unwrap().clone();
-
-                        let app_clone = app.clone();
-                        // Small delay to let recording thread finish, then process
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-
-                            let state = app_clone.state::<AppState>();
-                            let samples = state.recorded_samples.lock().unwrap().clone();
-                            let sample_rate = *state.recording_sample_rate.lock().unwrap();
-                            let config = state.config.lock().unwrap().clone();
-
-                            if samples.is_empty() {
-                                let _ = app_clone.emit("processing", ProcessingState {
-                                    stage: "error".to_string(),
-                                    text: "No audio recorded".to_string(),
-                                });
-                                return;
-                            }
-
-                            tauri::async_runtime::spawn(async move {
-                                if let Err(e) = process_pipeline(app_clone.clone(), samples, sample_rate, config, cancel_token).await {
-                                    if e != "interrupted" {
-                                        eprintln!("Pipeline error: {}", e);
-                                        let _ = app_clone.emit("processing", ProcessingState {
-                                            stage: "error".to_string(),
-                                            text: e,
-                                        });
-                                    }
-                                }
-                            });
-                        });
                     }
                 }
             })?;
