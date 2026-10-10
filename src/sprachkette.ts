@@ -42,6 +42,28 @@ type Stufe =
 const BASIS = (import.meta as { env?: Record<string, string> }).env
   ?.VITE_VOICE_API ?? "/voice-api";
 
+/**
+ * Debug-Ringpuffer (GH P0 10.10.: "no audio recorded" war blind).
+ * Die letzten 60 Zeilen liegen in window.__dexterLog + localStorage
+ * ("dexter-log") — Daniel muss nichts suchen, der Fehlertext nennt sie.
+ * Kein Build-Tool, keine Deps: reines TS.
+ */
+const LOG_MAX = 60;
+let ring: string[] = [];
+try {
+  ring = JSON.parse(localStorage.getItem("dexter-log") ?? "[]");
+  if (!Array.isArray(ring)) ring = [];
+} catch { ring = []; }
+function dlog(...teile: unknown[]): void {
+  const zeile = new Date().toISOString().slice(11, 19) + " "
+    + teile.map((t) => String(t)).join(" ");
+  ring.push(zeile);
+  if (ring.length > LOG_MAX) ring = ring.slice(-LOG_MAX);
+  try { localStorage.setItem("dexter-log", JSON.stringify(ring)); } catch { /* voll/privat */ }
+  try { (window as unknown as Record<string, unknown>).__dexterLog = [...ring]; } catch { /* egal */ }
+  console.debug("[dexter]", zeile);
+}
+
 /** Ein Ereignis so feuern, wie der Shim es an listen() weiterreicht. */
 function feuern(name: string, nutzlast: unknown): void {
   window.dispatchEvent(new CustomEvent(name, { detail: nutzlast }));
@@ -94,6 +116,8 @@ export async function starteAufnahme(): Promise<void> {
     const frist = new Promise<never>((_, weise_ab) =>
       setTimeout(() => weise_ab(new DOMException("", "TimeoutError")), 15000));
     spur = await Promise.race([mikro, frist]);
+    dlog("getUserMedia ok, tracks=",
+      spur.getAudioTracks().map((t) => t.label || "?").join(","));
   } catch (e) {
     // Kein stilles Scheitern: ohne Mikrofon ist die App nutzlos, und der
     // Nutzer muss wissen WARUM (Berechtigung abgelehnt? Kein Geraet?).
@@ -147,9 +171,16 @@ export async function beendeAufnahme(): Promise<void> {
 
   // Unter 0,3 s ist ein Verseher, kein Satz. Whisper halluziniert bei
   // Stille ganze Saetze ("Untertitel von ..."), das waere schlimmer als
-  // nichts.
+  // nichts. ABER: still verwerfen ist genauso schlimm — 10.10. hiess das
+  // bei Daniel "no audio recorded", und niemand sah warum. Deshalb Fehler
+  // mit Diagnose statt stillem Idle.
+  dlog("blob bytes=", audio.size, "type=", audio.type);
   if (audio.size < 2000) {
-    stufe("idle");
+    dlog("LEERBLOB verworfen (<2000 B): Mikrofon liefert keine Daten");
+    stufe("error",
+      "Mikrofon liefert leere Aufnahme — Eingabegerät in Windows prüfen "
+      + "(Einstellungen → Sound → Eingabe) und erneut drücken. "
+      + "Diagnose steht in der Konsole (F12) unter __dexterLog.");
     return;
   }
 
@@ -173,6 +204,7 @@ async function verarbeite(audio: Blob): Promise<void> {
   const rSTT = await fetch(`${BASIS}/hoeren`, {
     method: "POST", body: form, signal: abbruch.signal,
   });
+  dlog("POST hoeren ->", rSTT.status, "basis=", BASIS);
   if (!rSTT.ok) {
     throw new Error(`Spracherkennung: HTTP ${rSTT.status} von ${BASIS}/hoeren`);
   }
