@@ -284,78 +284,105 @@ async function verarbeite(audio: Blob): Promise<void> {
 
 // ---------------------------------------------------------------- Ausgabe
 
-/** Noch nicht gesprochene Saetze, damit `idle` zum richtigen Zeitpunkt kommt. */
+/** Noch offene Saetze (geholt oder gespielt) — steuert, wann `idle` kommt. */
 let offeneSaetze = 0;
 
 /** Laufender Abspieler, damit `unterbrich` ihn stoppen kann. */
 let aktuellesAudio: HTMLAudioElement | null = null;
-/** Fertige, noch nicht gespielte Saetze (Technik 2: Vorsprung halten). */
-const warteschlange: Array<{ nr: number; url: string }> = [];
 let spieltGerade = false;
 /** Abbruchmarke: nach `unterbrich` darf kein alter Satz mehr kommen. */
 let ausgabeLauf = 0;
 
 /**
- * Einen Satz sprechen — mit Breeze-TTS-2, nicht mit der Systemstimme.
+ * Einen Satz in die Ausgabe geben.
  *
  * GH#2894, Daniel 10.10.: "breeze war und die specs aus dem video!
- * obligatorisch! dann nutze auch die bestandteile und nichts anderes!"
- * Vorher stand hier `speechSynthesis` (Windows-Stimme Hedda). Die
- * funktioniert — sie ist nur nicht die Stimme aus dem Video.
+ * obligatorisch!" — die Stimme ist Breeze-TTS-2, nicht speechSynthesis.
  *
- * Technik 2 aus dem Video ("stop taking turns and make them parallel"):
- * Das Holen der Audiodaten laeuft SOFORT los, das Abspielen haengt sich
- * hinten an. Waehrend Satz N klingt, ist Satz N+1 schon unterwegs.
- * Voraussetzung ist eine Stimme, die schneller erzeugt als abspielt —
- * gemessen 1,6x Echtzeit (Codacus nennt 1,1x als Schwelle).
+ * Technik 2 aus dem Video heisst EIN Satz Vorsprung: "while one sentence
+ * is playing, the voice is already generating the next one". Nicht: alle
+ * Saetze gleichzeitig anfordern. Breeze arbeitet seriell — gemessen am
+ * 10.10. im Caddy-Log, als vier Abrufe zusammen rausgingen: 34,89 s /
+ * 37,38 s / 63,65 s / 39,05 s, wo einer allein 1,5 s braucht. Der letzte
+ * wartet auf die Summe aller vorherigen. Daniel sah das als "2x dieselbe
+ * frage geht nicht": seine zweite Frage kam an und stand hinter dem Stau.
+ *
+ * Deshalb eine Schlange mit genau einem Abruf gleichzeitig und
+ * VORSPRUNG Saetzen Vorsprung.
  */
-function sprichSatz(satz: string): void {
-  const meinLauf = ausgabeLauf;
-  offeneSaetze++;
-  const nr = offeneSaetze;
+const VORSPRUNG = 1;
 
-  void (async () => {
-    try {
-      const r = await fetch(`${BASIS}/stimme`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: satz }),
-      });
-      if (meinLauf !== ausgabeLauf) return; // unterbrochen
-      if (!r.ok) {
-        // Kein stiller Ausfall. Der Dienst liefert bei einem Fehler JSON
-        // mit Adresse und Modell — genau das gehoert in die Anzeige,
-        // sonst sucht man an einem stummen Abspieler nach der Ursache.
-        let grund = `HTTP ${r.status}`;
-        try {
-          const j = await r.json();
-          if (j?.fehler) grund = `${j.fehler} (${j.tts ?? "?"})`;
-        } catch { /* Antwort war kein JSON */ }
-        dlog("stimme FEHLER", grund);
-        stufe("error", `Sprachausgabe: ${grund}`);
-        offeneSaetze = Math.max(0, offeneSaetze - 1);
-        return;
-      }
-      const blob = await r.blob();
-      dlog("stimme ok nr=", nr, "bytes=", blob.size, "type=", blob.type);
-      if (meinLauf !== ausgabeLauf) return;
-      warteschlange.push({ nr, url: URL.createObjectURL(blob) });
-      warteschlange.sort((a, b) => a.nr - b.nr);
-      void spieleNaechsten(meinLauf);
-    } catch (e) {
-      dlog("stimme Ausnahme", String(e));
-      stufe("error", `Sprachausgabe: ${String(e)}`);
-      offeneSaetze = Math.max(0, offeneSaetze - 1);
-    }
-  })();
+/** Saetze, die noch geholt werden muessen — in Reihenfolge. */
+const zuHolen: Array<{ nr: number; text: string }> = [];
+/** Fertige Audiodaten, die noch nicht gespielt sind. */
+const bereit: Array<{ nr: number; url: string }> = [];
+let holtGerade = false;
+let laufenderAbruf: AbortController | null = null;
+
+function sprichSatz(satz: string): void {
+  offeneSaetze++;
+  zuHolen.push({ nr: offeneSaetze, text: satz });
+  void holeNaechsten(ausgabeLauf);
 }
 
-/** Spielt die Warteschlange ab, einen Satz nach dem anderen. */
+/** Holt EINEN Satz nach dem anderen, hoechstens VORSPRUNG im Voraus. */
+async function holeNaechsten(meinLauf: number): Promise<void> {
+  if (holtGerade || meinLauf !== ausgabeLauf) return;
+  if (bereit.length > VORSPRUNG) return;   // genug Vorrat
+  const naechster = zuHolen.shift();
+  if (!naechster) return;
+
+  holtGerade = true;
+  const abbruch = new AbortController();
+  laufenderAbruf = abbruch;
+  try {
+    const r = await fetch(`${BASIS}/stimme`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: naechster.text }),
+      signal: abbruch.signal,
+    });
+    if (meinLauf !== ausgabeLauf) return;
+    if (!r.ok) {
+      // Kein stiller Ausfall: der Dienst liefert bei einem Fehler JSON
+      // mit Adresse und Modell. Ein stummer Abspieler sieht sonst aus
+      // wie ein kaputtes Audiogeraet, und man sucht am falschen Ende.
+      let grund = `HTTP ${r.status}`;
+      try {
+        const j = await r.json();
+        if (j?.fehler) grund = `${j.fehler} (${j.tts ?? "?"})`;
+      } catch { /* Antwort war kein JSON */ }
+      dlog("stimme FEHLER", grund);
+      stufe("error", `Sprachausgabe: ${grund}`);
+      offeneSaetze = Math.max(0, offeneSaetze - 1);
+      return;
+    }
+    const blob = await r.blob();
+    if (meinLauf !== ausgabeLauf) return;
+    dlog("stimme ok nr=", naechster.nr, "bytes=", blob.size);
+    bereit.push({ nr: naechster.nr, url: URL.createObjectURL(blob) });
+    bereit.sort((a, b) => a.nr - b.nr);
+    void spieleNaechsten(meinLauf);
+  } catch (e) {
+    if ((e as Error)?.name === "AbortError") return;  // gewollt
+    dlog("stimme Ausnahme", String(e));
+    stufe("error", `Sprachausgabe: ${String(e)}`);
+    offeneSaetze = Math.max(0, offeneSaetze - 1);
+  } finally {
+    holtGerade = false;
+    laufenderAbruf = null;
+    if (meinLauf === ausgabeLauf) void holeNaechsten(meinLauf);
+  }
+}
+
+/** Spielt die fertigen Saetze der Reihe nach ab. */
 async function spieleNaechsten(meinLauf: number): Promise<void> {
   if (spieltGerade || meinLauf !== ausgabeLauf) return;
-  const naechster = warteschlange.shift();
+  const naechster = bereit.shift();
   if (!naechster) return;
   spieltGerade = true;
+  // Platz frei: der naechste Satz darf jetzt geholt werden.
+  void holeNaechsten(meinLauf);
   try {
     const a = new Audio(naechster.url);
     aktuellesAudio = a;
@@ -364,9 +391,6 @@ async function spieleNaechsten(meinLauf: number): Promise<void> {
       a.onended = () => fertig();
       a.onerror = () => { dlog("audio onerror nr=", naechster.nr); fertig(); };
       void a.play().catch((e) => {
-        // Ohne Nutzergeste blockieren Browser die Wiedergabe. In der
-        // Tauri-Anwendung ist das nicht der Fall, im Browsertab schon —
-        // und dann ist Stille das Symptom.
         dlog("audio play blockiert:", String(e));
         stufe("error", `Wiedergabe blockiert: ${String(e)}`);
         fertig();
@@ -377,10 +401,13 @@ async function spieleNaechsten(meinLauf: number): Promise<void> {
     aktuellesAudio = null;
     spieltGerade = false;
     offeneSaetze = Math.max(0, offeneSaetze - 1);
-    if (warteschlange.length) {
+    if (meinLauf !== ausgabeLauf) return;
+    if (bereit.length) {
       void spieleNaechsten(meinLauf);
     } else if (offeneSaetze === 0 && !laufendeAntwort) {
       stufe("idle");
+    } else {
+      void holeNaechsten(meinLauf);
     }
   }
 }
@@ -397,8 +424,15 @@ export function unterbrich(): void {
     aktuellesAudio.pause();
     aktuellesAudio = null;
   }
-  while (warteschlange.length) {
-    const w = warteschlange.pop();
+  // Den laufenden Abruf WIRKLICH abbrechen. Vorher wurde nur sein
+  // Ergebnis verworfen — die Anfrage lief weiter und belegte Breeze,
+  // das seriell arbeitet. Genau daran stand Daniels zweite Frage an.
+  laufenderAbruf?.abort();
+  laufenderAbruf = null;
+  holtGerade = false;
+  zuHolen.length = 0;
+  while (bereit.length) {
+    const w = bereit.pop();
     if (w) URL.revokeObjectURL(w.url);
   }
   spieltGerade = false;
