@@ -115,11 +115,25 @@ impl Default for VoiceConfig {
             .unwrap_or_default();
         Self {
             whisper_model_path: default_model,
-            ollama_url: "http://localhost:11434".to_string(),
+            // 16.10.2026 (CEO, GH#2989): unsere Voice-API, nicht
+            // localhost. Auf Daniels Rechner laeuft kein Ollama und
+            // kein Chatterbox; die Kette haengt an netcup1 (Caddy ->
+            // 8105) und von dort an gpu-server-1. Mit der alten
+            // Vorgabe lief ein frisch installiertes Programm gegen
+            // einen Port, an dem nichts lauscht.
+            //
+            // ollama_url traegt BEIDES: /api/chat und — ueber
+            // stt_basis in start_recording — /hoeren. Deshalb hier die
+            // Basis ohne Endpunkt.
+            ollama_url: "https://app.make-my-life-easier.com/voice-api".to_string(),
             ollama_model: "qwen3:4b".to_string(),
             embed_model: "nomic-embed-text".to_string(),
             vision_model: "llava".to_string(),
-            chatterbox_url: "http://localhost:8005".to_string(),
+            // Dieselbe Basis: /v1/audio/speech dort ist unser Umweg
+            // auf Breeze-TTS-2 (audio.cpp, gpu-server-1:11452). Der
+            // Name chatterbox_url bleibt — das ist Codacus' Feld, und
+            // ein umbenanntes Feld macht den Fork nicht nachziehbar.
+            chatterbox_url: "https://app.make-my-life-easier.com/voice-api".to_string(),
             chatterbox_voice: "Anirban.wav".to_string(),
             system_prompt: "You are a voice assistant running on the user's desktop. The conversation happens entirely through voice — the user speaks into their microphone, their speech is transcribed to text via Whisper (STT), sent to you as a message, and your response is converted back to speech via Chatterbox Turbo (TTS) and played through their speakers. You can hear them and they can hear you — treat this as a natural spoken conversation. If they ask \"can you hear me\" the answer is yes.\n\nKeep responses concise and conversational — 2-3 sentences max. No markdown, no code blocks, no bullet points, no numbered lists, no special formatting. Write exactly as you would speak out loud. Avoid colons in your responses as they cause unnatural pauses in TTS.\n\nYou can express emotions naturally using these paralinguistic tags inline with your speech — use them sparingly and only when they genuinely fit the moment:\n[laugh] [chuckle] [sigh] [gasp] [cough] [clear throat] [sniff] [groan] [shush]\nExample — \"Oh wow, that's actually hilarious [laugh] I didn't expect that at all.\"\nDo NOT overuse them. Most responses need zero tags. Only use them when a human would genuinely make that sound.\n\nWhen you decide to use a tool, ALWAYS say what you're about to do first in a short natural sentence before calling the tool. For example — \"Let me take a look at your screen\" before taking a screenshot, \"Let me search the web for that\" before fetching a page, \"Let me check the time\" before getting the time, \"One sec, let me run that command\" before executing a shell command. This way the user hears what's happening instead of waiting in silence.".to_string(),
             tools: ToolsConfig::default(),
@@ -140,12 +154,39 @@ impl VoiceConfig {
         let path = Self::config_path();
         if path.exists() {
             if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str(&data) {
-                    return config;
+                if let Ok(config) = serde_json::from_str::<Self>(&data) {
+                    return config.ohne_localhost();
                 }
             }
         }
         Self::default()
+    }
+
+    /// 16.10.2026 (CEO, GH#2989): gespeicherte localhost-Adressen gegen
+    /// die echten tauschen.
+    ///
+    /// Eine Aenderung an `Default` erreicht eine BESTEHENDE Installation
+    /// nicht — dort liegt schon eine config.json, und `load` nimmt sie
+    /// wie sie ist. Daniels Programm zeigte damit weiter auf
+    /// http://localhost:11434 und http://localhost:8005, wo auf seinem
+    /// Rechner nichts lauscht. Ohne diesen Schritt haette er von Hand in
+    /// %APPDATA%\voice-assistant\config.json editieren muessen.
+    ///
+    /// Nur localhost wird ersetzt, nichts anderes: wer absichtlich eine
+    /// eigene Adresse eingetragen hat, behaelt sie.
+    fn ohne_localhost(mut self) -> Self {
+        let vorgabe = Self::default();
+        if Self::ist_localhost(&self.ollama_url) {
+            self.ollama_url = vorgabe.ollama_url;
+        }
+        if Self::ist_localhost(&self.chatterbox_url) {
+            self.chatterbox_url = vorgabe.chatterbox_url;
+        }
+        self
+    }
+
+    fn ist_localhost(adresse: &str) -> bool {
+        adresse.contains("localhost") || adresse.contains("127.0.0.1")
     }
 
     fn save(&self) {
